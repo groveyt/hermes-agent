@@ -463,28 +463,90 @@ class _LineClient:
     async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
+        started = time.monotonic()
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(
                 LINE_REPLY_URL,
                 headers=self._headers,
                 json={"replyToken": reply_token, "messages": messages},
             ) as resp:
+                body = await resp.text()
                 if resp.status >= 400:
-                    body = await resp.text()
+                    self._log_delivery_failure("reply", resp, body, started)
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                self._log_delivery_receipt("reply", resp, body, started)
 
     async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
+        started = time.monotonic()
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(
                 LINE_PUSH_URL,
                 headers=self._headers,
                 json={"to": chat_id, "messages": messages},
             ) as resp:
+                body = await resp.text()
                 if resp.status >= 400:
-                    body = await resp.text()
+                    self._log_delivery_failure("push", resp, body, started)
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                self._log_delivery_receipt("push", resp, body, started)
+
+    @staticmethod
+    def _log_delivery_receipt(operation: str, resp, body: str, started: float) -> None:
+        """Log LINE's delivery receipt without tokens or message content."""
+        request_id = (
+            resp.headers.get("x-line-request-id")
+            or resp.headers.get("X-Line-Request-Id")
+            or "-"
+        )
+        message_ids: List[str] = []
+        try:
+            payload = json.loads(body) if body else {}
+            message_ids = [
+                str(item["id"])
+                for item in payload.get("sentMessages", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+        except (TypeError, ValueError):
+            pass
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.info(
+            "LINE delivery success: operation=%s status=%s request_id=%s "
+            "message_ids=%s count=%s elapsed_ms=%s",
+            operation,
+            resp.status,
+            request_id,
+            ",".join(message_ids) or "-",
+            len(message_ids),
+            elapsed_ms,
+        )
+
+    @staticmethod
+    def _log_delivery_failure(operation: str, resp, body: str, started: float) -> None:
+        """Log a safe LINE API error summary without request payload secrets."""
+        request_id = (
+            resp.headers.get("x-line-request-id")
+            or resp.headers.get("X-Line-Request-Id")
+            or "-"
+        )
+        error = "http_error"
+        try:
+            payload = json.loads(body) if body else {}
+            if isinstance(payload, dict) and payload.get("message"):
+                error = str(payload["message"])[:200].replace("\n", " ")
+        except (TypeError, ValueError):
+            pass
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        logger.warning(
+            "LINE delivery failed: operation=%s status=%s request_id=%s "
+            "error=%s elapsed_ms=%s",
+            operation,
+            resp.status,
+            request_id,
+            error,
+            elapsed_ms,
+        )
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""

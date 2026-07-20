@@ -19,6 +19,8 @@ import hashlib
 import hmac
 import base64
 import json
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -45,6 +47,45 @@ validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
+_LineClient = _line._LineClient
+
+
+class _FakeLineResponse:
+    def __init__(self, *, status=200, body="{}", headers=None):
+        self.status = status
+        self._body = body
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def text(self):
+        return self._body
+
+
+class _FakeLineSession:
+    def __init__(self, response, **kwargs):
+        self._response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def post(self, *args, **kwargs):
+        return self._response
+
+
+def _install_fake_aiohttp(monkeypatch, response):
+    fake = SimpleNamespace(
+        ClientTimeout=lambda **kwargs: kwargs,
+        ClientSession=lambda **kwargs: _FakeLineSession(response, **kwargs),
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake)
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +338,72 @@ class TestMarkdownAndChunking:
 
 
 # ---------------------------------------------------------------------------
-# 7. Send routing (reply -> push fallback, batching, system-bypass)
+# 7. LINE API delivery observability
+# ---------------------------------------------------------------------------
+
+class TestLineClientDeliveryLogging:
+
+    def test_reply_success_logs_delivery_receipt_without_secrets(
+        self, monkeypatch, caplog
+    ):
+        response = _FakeLineResponse(
+            status=200,
+            body=json.dumps({"sentMessages": [{"id": "msg-123"}]}),
+            headers={"x-line-request-id": "req-456"},
+        )
+        _install_fake_aiohttp(monkeypatch, response)
+        client = _LineClient("secret-access-token")
+
+        with caplog.at_level("INFO"):
+            asyncio.run(
+                client.reply(
+                    "secret-reply-token",
+                    [{"type": "text", "text": "private message body"}],
+                )
+            )
+
+        log_text = caplog.text
+        assert "LINE delivery success" in log_text
+        assert "operation=reply" in log_text
+        assert "status=200" in log_text
+        assert "request_id=req-456" in log_text
+        assert "message_ids=msg-123" in log_text
+        assert "secret-access-token" not in log_text
+        assert "secret-reply-token" not in log_text
+        assert "private message body" not in log_text
+
+    def test_push_failure_logs_status_request_id_and_safe_error(
+        self, monkeypatch, caplog
+    ):
+        response = _FakeLineResponse(
+            status=429,
+            body=json.dumps({"message": "Too many requests"}),
+            headers={"x-line-request-id": "req-rate-limit"},
+        )
+        _install_fake_aiohttp(monkeypatch, response)
+        client = _LineClient("secret-access-token")
+
+        with caplog.at_level("WARNING"), pytest.raises(RuntimeError):
+            asyncio.run(
+                client.push(
+                    "Usecret-chat",
+                    [{"type": "text", "text": "private message body"}],
+                )
+            )
+
+        log_text = caplog.text
+        assert "LINE delivery failed" in log_text
+        assert "operation=push" in log_text
+        assert "status=429" in log_text
+        assert "request_id=req-rate-limit" in log_text
+        assert "error=Too many requests" in log_text
+        assert "secret-access-token" not in log_text
+        assert "Usecret-chat" not in log_text
+        assert "private message body" not in log_text
+
+
+# ---------------------------------------------------------------------------
+# 8. Send routing (reply -> push fallback, batching, system-bypass)
 # ---------------------------------------------------------------------------
 
 class TestSendRouting:
