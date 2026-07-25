@@ -35,6 +35,26 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+_NON_CONVERSATIONAL_CAPABILITY = object()
+_NON_CONVERSATIONAL_CAPABILITY_KEY = "_hermes_non_conversational_capability"
+
+
+def _mark_non_conversational_metadata(metadata: dict | None = None) -> dict:
+    """Attach an internal identity capability to trusted lifecycle/status sends."""
+    merged = dict(metadata or {})
+    merged["non_conversational"] = True
+    merged[_NON_CONVERSATIONAL_CAPABILITY_KEY] = _NON_CONVERSATIONAL_CAPABILITY
+    return merged
+
+
+def _is_trusted_non_conversational_metadata(metadata) -> bool:
+    """Accept only metadata stamped by the gateway's internal capability."""
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("non_conversational") is True
+        and metadata.get(_NON_CONVERSATIONAL_CAPABILITY_KEY)
+        is _NON_CONVERSATIONAL_CAPABILITY
+    )
 
 
 def _platform_name(platform) -> str:

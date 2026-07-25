@@ -314,6 +314,28 @@ class TestRequestCache:
 
         assert c.get(rid) is None
 
+    def test_register_pending_fails_closed_at_hard_cap(self):
+        c = RequestCache(max_entries=2)
+
+        first = c.register_pending("Uone")
+        second = c.register_pending("Utwo")
+        denied = c.register_pending("Uthree")
+
+        assert first and second
+        assert denied is None
+        assert len(c._entries) == 2
+
+    def test_register_pending_prunes_expired_entry_before_admission(self):
+        c = RequestCache(pending_ttl_seconds=10, max_entries=1)
+        expired = c.register_pending("Uold")
+        c._entries[expired].created_at -= 11
+
+        admitted = c.register_pending("Unew")
+
+        assert admitted is not None
+        assert c.get(expired) is None
+        assert len(c._entries) == 1
+
 
 # ---------------------------------------------------------------------------
 # 6. Markdown stripping + chunking
@@ -622,6 +644,12 @@ class TestPushQuotaBudget:
             ({"type": "limited", "value": 0}, {"totalUsage": 0}),
             ({"type": "limited", "value": 200}, {"totalUsage": -1}),
             ({"type": "limited", "value": "bad"}, {"totalUsage": 0}),
+            ({"type": "limited", "value": 200.9}, {"totalUsage": 0}),
+            ({"type": "limited", "value": 200}, {"totalUsage": 0.9}),
+            ({"type": "limited", "value": "200"}, {"totalUsage": 0}),
+            ({"type": "limited", "value": " 200 "}, {"totalUsage": 0}),
+            ({"type": "limited", "value": "٢٠٠"}, {"totalUsage": 0}),
+            ({"type": "limited", "value": 200}, {"totalUsage": "0"}),
         ],
     )
     def test_malformed_quota_fails_closed(self, quota, consumption):
@@ -961,6 +989,40 @@ class TestSendRouting:
         adapter._client.reply.assert_not_called()
         assert adapter._client.push.await_count == 2
 
+    def test_foreign_adapter_context_cannot_bypass_active_reservation(
+        self, adapter, monkeypatch
+    ):
+        import time as _time
+        from gateway.config import PlatformConfig
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        other = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "other-token",
+            "channel_secret": "other-secret",
+        }))
+        adapter._begin_delivery_run("Usame", "a-run")
+        adapter._reply_tokens["Usame"] = ("a-token", _time.time() + 30)
+        adapter._reply_token_runs["Usame"] = "a-run"
+        adapter._auto_push_reservations.add("Usame")
+        adapter._auto_push_reservation_runs["Usame"] = "a-run"
+        adapter._quota_budget = MagicMock()
+        tokens = set_session_vars(chat_id="Usame", message_id="b-run")
+        foreign_epoch = _line._DELIVERY_TASK_EPOCH.set(
+            (other, other._delivery_epoch)
+        )
+        try:
+            result = asyncio.run(adapter.send("Usame", "foreign output"))
+        finally:
+            _line._DELIVERY_TASK_EPOCH.reset(foreign_epoch)
+            clear_session_vars(tokens)
+
+        assert not result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+        assert "Usame" in adapter._reply_tokens
+        assert "Usame" in adapter._auto_push_reservations
+        adapter._quota_budget.finish.assert_not_called()
+
     def test_system_bypass_is_suppressed_during_auto_push_reservation(self, adapter):
         adapter._auto_push_reservations.add("Uchat")
         adapter._quota_budget = MagicMock()
@@ -972,6 +1034,103 @@ class TestSendRouting:
         adapter._client.push.assert_not_called()
         assert "Uchat" in adapter._auto_push_reservations
         adapter._quota_budget.finish.assert_not_called()
+
+    def test_working_heartbeat_cannot_consume_reserved_final_push(
+        self, adapter, caplog
+    ):
+        adapter._auto_push_reservations.add("Uchat")
+        adapter._quota_budget = MagicMock()
+        from gateway.run import _non_conversational_metadata
+        from gateway.platforms.base import _is_trusted_non_conversational_metadata
+
+        metadata = _non_conversational_metadata(platform="line")
+        assert metadata and metadata["non_conversational"] is True
+        assert _is_trusted_non_conversational_metadata(metadata)
+        with caplog.at_level("INFO"):
+            heartbeat = asyncio.run(adapter.send(
+                "Uchat",
+                "⏳ Working — 3 min — iteration 6/60, receiving stream response",
+                metadata=metadata,
+            ))
+
+        assert heartbeat.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+        assert "Uchat" in adapter._auto_push_reservations
+        adapter._quota_budget.finish.assert_not_called()
+        assert "reason=reserved_for_final" in caplog.text
+        assert "kind=heartbeat" in caplog.text
+        assert "Uchat" not in caplog.text
+        assert "receiving stream response" not in caplog.text
+
+        final = asyncio.run(adapter.send("Uchat", "actual final answer"))
+
+        assert final.success
+        adapter._client.push.assert_called_once()
+        adapter._quota_budget.finish.assert_called_once_with(pushed=True)
+        assert "Uchat" not in adapter._auto_push_reservations
+
+    def test_working_prefixed_conversational_final_is_not_suppressed(self, adapter):
+        adapter._auto_push_reservations.add("Uchat")
+        adapter._quota_budget = MagicMock()
+
+        result = asyncio.run(adapter.send(
+            "Uchat",
+            "⏳ Working — final answer: all completed",
+            metadata={},
+        ))
+
+        assert result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_called_once()
+        adapter._quota_budget.finish.assert_called_once_with(pushed=True)
+
+    def test_forged_non_conversational_dict_cannot_suppress_final(self, adapter):
+        adapter._auto_push_reservations.add("Uchat")
+        adapter._quota_budget = MagicMock()
+
+        result = asyncio.run(adapter.send(
+            "Uchat",
+            "⏳ Working — user final that must be visible",
+            metadata={"non_conversational": True},
+        ))
+
+        assert result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_called_once()
+        adapter._quota_budget.finish.assert_called_once_with(pushed=True)
+
+    def test_completed_run_suppression_is_logged_without_payload(self, adapter, caplog):
+        adapter._auto_push_completed_chats.add("Uchat")
+
+        with caplog.at_level("INFO"):
+            result = asyncio.run(adapter.send("Uchat", "private final payload"))
+
+        assert result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+        assert "reason=run_completed" in caplog.text
+        assert "kind=text" in caplog.text
+        assert "Uchat" not in caplog.text
+        assert "private final payload" not in caplog.text
+
+    def test_media_token_state_is_hard_capped_and_cleans_evicted_tempfile(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(_line, "MAX_DELIVERY_STATE_ENTRIES", 2)
+        paths = []
+        tokens = []
+        for index in range(3):
+            path = tmp_path / f"preview-{index}.png"
+            path.write_bytes(b"png")
+            paths.append(path)
+            tokens.append(adapter._register_media(str(path), cleanup=True))
+
+        assert len(adapter._media_tokens) == 2
+        assert len(adapter._media_temp_paths) == 2
+        assert tokens[0] not in adapter._media_tokens
+        assert not paths[0].exists()
+        assert paths[1].exists() and paths[2].exists()
 
     def test_reserved_media_push_consumes_single_budget_and_blocks_followup_text(self, adapter):
         adapter._auto_push_reservations.add("Uchat")
@@ -1719,6 +1878,144 @@ class TestSlowResponseRouting:
         assert "Uchat" not in adapter._pending_buttons
         assert not adapter._quota_guarded_postbacks
 
+    def test_full_postback_cache_fails_closed_without_invalid_button(self, adapter):
+        import time as _time
+
+        adapter._cache = RequestCache(max_entries=1)
+        existing = adapter._cache.register_pending("Uexisting")
+        adapter._client.reply = AsyncMock()
+        adapter._quota_budget.reserve = AsyncMock(return_value=SimpleNamespace(
+            allowed=False,
+            reason="quota_unavailable",
+            effective_usage=None,
+            soft_limit=None,
+        ))
+        adapter._reply_tokens["Uchat"] = ("reply-token", _time.time() + 30)
+
+        asyncio.run(adapter._handle_slow_threshold("Uchat"))
+
+        assert existing is not None
+        assert len(adapter._cache._entries) == 1
+        assert "Uchat" not in adapter._pending_buttons
+        assert None not in adapter._quota_guarded_postbacks
+        assert "Uchat" in adapter._blocked_slow_pushes
+        adapter._client.reply.assert_awaited_once()
+        sent = adapter._client.reply.call_args.args[1][0]
+        assert sent["type"] == "text"
+        assert "Uchat" not in adapter._reply_tokens
+
+    def test_expired_postback_admission_clears_stale_side_state(self, adapter):
+        import time as _time
+
+        adapter.slow_response_mode = "postback"
+        adapter._cache._pending_ttl = 10
+        adapter._cache._max_entries = 1
+        stale_rid = adapter._cache.register_pending("Uold")
+        adapter._pending_buttons["Uold"] = stale_rid
+        adapter._postback_delivering.add(stale_rid)
+        adapter._cache._entries[stale_rid].created_at -= 11
+        adapter._client.reply = AsyncMock()
+        adapter._client.push = AsyncMock()
+        adapter._reply_tokens["Unew"] = ("new-token", _time.time() + 30)
+
+        asyncio.run(adapter._handle_slow_threshold("Unew"))
+
+        assert "Uold" not in adapter._pending_buttons
+        assert stale_rid not in adapter._quota_guarded_postbacks
+        assert stale_rid not in adapter._postback_delivering
+        result = asyncio.run(adapter.send("Uold", "old final"))
+        assert result.success
+        adapter._client.push.assert_awaited_once()
+
+    def test_final_triggering_expired_legacy_postback_falls_back_to_push(self, adapter):
+        adapter.slow_response_mode = "postback"
+        adapter._cache._pending_ttl = 10
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        adapter._cache._entries[rid].created_at -= 11
+        adapter._client.push = AsyncMock()
+
+        result = asyncio.run(adapter.send("Uchat", "actual final"))
+
+        assert result.success
+        assert "Uchat" not in adapter._pending_buttons
+        assert adapter._cache.get(rid) is None
+        adapter._client.push.assert_awaited_once()
+
+    def test_final_triggering_expired_guarded_postback_fails_closed(self, adapter):
+        adapter._cache._pending_ttl = 10
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        adapter._quota_guarded_postbacks.add(rid)
+        adapter._cache._entries[rid].created_at -= 11
+        adapter._client.push = AsyncMock()
+
+        result = asyncio.run(adapter.send("Uchat", "actual final"))
+
+        assert not result.success
+        assert "Uchat" not in adapter._pending_buttons
+        assert adapter._cache.get(rid) is None
+        adapter._client.push.assert_not_awaited()
+
+    def test_expired_quota_postbacks_remain_bounded_and_block_old_final(self, adapter):
+        import time as _time
+
+        adapter._cache._pending_ttl = 10
+        adapter._cache._max_entries = 2
+        adapter._client.reply = AsyncMock()
+        adapter._client.push = AsyncMock()
+        adapter._quota_budget.reserve = AsyncMock(return_value=SimpleNamespace(
+            allowed=False,
+            reason="quota_unavailable",
+            effective_usage=None,
+            soft_limit=None,
+        ))
+
+        for chat_id in ("Uold1", "Uold2"):
+            adapter._reply_tokens[chat_id] = (
+                f"token-{chat_id}",
+                _time.time() + 30,
+            )
+            asyncio.run(adapter._handle_slow_threshold(chat_id))
+        stale_ids = set(adapter._pending_buttons.values())
+        for request_id in stale_ids:
+            adapter._cache._entries[request_id].created_at -= 11
+
+        for chat_id in ("Unew1", "Unew2"):
+            adapter._reply_tokens[chat_id] = (
+                f"token-{chat_id}",
+                _time.time() + 30,
+            )
+            asyncio.run(adapter._handle_slow_threshold(chat_id))
+
+        assert set(adapter._pending_buttons) == {"Unew1", "Unew2"}
+        assert len(adapter._pending_buttons) == 2
+        assert len(adapter._quota_guarded_postbacks) == 2
+        assert stale_ids.isdisjoint(adapter._quota_guarded_postbacks)
+        assert {"Uold1", "Uold2"} <= adapter._blocked_slow_pushes
+        result = asyncio.run(adapter.send("Uold1", "late old final"))
+        assert not result.success
+        adapter._client.push.assert_not_awaited()
+
+    def test_pruning_old_entry_does_not_block_new_same_chat_guard(self, adapter):
+        old_guard = _line._DeliveryTaskGuard(adapter, "Uchat", "old-run")
+        new_guard = _line._DeliveryTaskGuard(adapter, "Uchat", "new-run")
+        adapter._cache._pending_ttl = 10
+        rid = adapter._cache.register_pending("Uchat", delivery_guard=old_guard)
+        adapter._pending_buttons["Uchat"] = rid
+        adapter._quota_guarded_postbacks.add(rid)
+        adapter._cache._entries[rid].created_at -= 11
+
+        token = _line._DELIVERY_TASK_GUARD.set(new_guard)
+        try:
+            adapter._cache.prune()
+        finally:
+            _line._DELIVERY_TASK_GUARD.reset(token)
+
+        assert old_guard.blocked is True
+        assert new_guard.blocked is False
+        assert "Uchat" not in adapter._blocked_slow_pushes
+
     def test_safe_dm_reserves_auto_push(self, adapter):
         adapter._quota_budget.reserve = AsyncMock(return_value=SimpleNamespace(
             allowed=True,
@@ -1913,6 +2210,66 @@ class TestSlowResponseRouting:
         adapter._client.push.assert_not_called()
         assert "Uchat" not in adapter._blocked_slow_pushes
 
+    def test_quota_denied_postback_blocks_native_media_before_registration(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        import time as _time
+
+        image = tmp_path / "answer.png"
+        image.write_bytes(b"png")
+        adapter.public_base_url = "https://line.example.com"
+        adapter._client.reply = AsyncMock()
+        adapter._client.push = AsyncMock()
+        adapter._quota_budget.reserve = AsyncMock(return_value=SimpleNamespace(
+            allowed=False,
+            reason="soft_limit_reached",
+            effective_usage=160,
+            soft_limit=160,
+        ))
+        adapter._reply_tokens["Uchat"] = ("rt-token", _time.time() + 30)
+        register = MagicMock()
+        monkeypatch.setattr(adapter, "_register_media", register)
+
+        asyncio.run(adapter._handle_slow_threshold("Uchat"))
+        result = asyncio.run(adapter.send_image_file("Uchat", str(image)))
+
+        assert "Uchat" in adapter._pending_buttons
+        assert not result.success
+        adapter._client.reply.assert_awaited_once()
+        adapter._client.push.assert_not_called()
+        register.assert_not_called()
+
+    def test_full_cache_block_stops_native_media_before_registration(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        import time as _time
+
+        image = tmp_path / "answer.png"
+        image.write_bytes(b"png")
+        adapter.public_base_url = "https://line.example.com"
+        adapter._cache = RequestCache(max_entries=1)
+        adapter._cache.register_pending("Uexisting")
+        adapter._client.reply = AsyncMock()
+        adapter._client.push = AsyncMock()
+        adapter._quota_budget.reserve = AsyncMock(return_value=SimpleNamespace(
+            allowed=False,
+            reason="quota_unavailable",
+            effective_usage=None,
+            soft_limit=None,
+        ))
+        adapter._reply_tokens["Uchat"] = ("rt-token", _time.time() + 30)
+        register = MagicMock()
+        monkeypatch.setattr(adapter, "_register_media", register)
+
+        asyncio.run(adapter._handle_slow_threshold("Uchat"))
+        result = asyncio.run(adapter.send_image_file("Uchat", str(image)))
+
+        assert "Uchat" in adapter._blocked_slow_pushes
+        assert not result.success
+        adapter._client.reply.assert_awaited_once()
+        adapter._client.push.assert_not_called()
+        register.assert_not_called()
+
     def test_default_postback_mode_preserves_legacy_final_push_after_card_failure(self, adapter):
         import time as _time
         adapter.slow_response_mode = "postback"
@@ -1941,6 +2298,30 @@ class TestSlowResponseRouting:
 
         assert adapter._quota_budget._active_reservations == 0
         assert not adapter._auto_push_reservations
+
+    def test_disconnect_clears_ready_postback_cache_before_reconnect(self, adapter):
+        old_guard = _line._DeliveryTaskGuard(adapter, "Uchat", "old-run")
+        rid = adapter._cache.register_pending("Uchat", delivery_guard=old_guard)
+        assert adapter._cache.set_ready(rid, "stale payload")
+        adapter._client.reply = AsyncMock()
+
+        asyncio.run(adapter.disconnect())
+        adapter._disconnecting = False
+        adapter._delivery_epoch += 1
+        event = {
+            "postback": {
+                "data": json.dumps({
+                    "action": "show_response",
+                    "request_id": rid,
+                })
+            },
+            "replyToken": "fresh-token",
+            "source": {"type": "user", "userId": "Uchat"},
+        }
+        asyncio.run(adapter._handle_postback_event(event))
+
+        assert adapter._cache.get(rid) is None
+        adapter._client.reply.assert_not_awaited()
 
     def test_old_run_cannot_deliver_after_disconnect_or_reconnect(
         self, adapter, tmp_path, monkeypatch
@@ -2029,6 +2410,67 @@ class TestSlowResponseRouting:
             adapter._client.reply.assert_not_called()
             adapter._client.push.assert_not_called()
             register.assert_not_called()
+
+        asyncio.run(scenario())
+
+    def test_evicted_quota_block_cannot_reauthorize_bound_old_task(
+        self, adapter, monkeypatch
+    ):
+        import time as _time
+
+        async def scenario():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            result = {}
+            monkeypatch.setattr(_line, "MAX_DELIVERY_STATE_ENTRIES", 2)
+            adapter._cache._max_entries = 2
+            adapter._cache._pending_ttl = 10
+            adapter._client.reply = AsyncMock()
+            adapter._client.push = AsyncMock()
+            adapter._quota_budget.reserve = AsyncMock(return_value=SimpleNamespace(
+                allowed=False,
+                reason="quota_unavailable",
+                effective_usage=None,
+                soft_limit=None,
+            ))
+            adapter._reply_tokens["Uvictim"] = (
+                "victim-token",
+                _time.time() + 30,
+            )
+
+            async def delayed_delivery(_event, _session_key):
+                await adapter._handle_slow_threshold("Uvictim")
+                started.set()
+                await release.wait()
+                result["final"] = await adapter.send("Uvictim", "late final")
+
+            monkeypatch.setattr(adapter, "_process_message_background", delayed_delivery)
+            event = _line.MessageEvent(
+                text="start",
+                message_type=_line.MessageType.TEXT,
+                source=SimpleNamespace(chat_id="Uvictim"),
+                message_id="victim-run",
+            )
+
+            assert adapter._start_session_processing(event, "Uvictim")
+            await started.wait()
+            victim_rid = adapter._pending_buttons["Uvictim"]
+            victim_guard = adapter._cache._entries[victim_rid].delivery_guard
+            adapter._cache._entries[victim_rid].created_at -= 11
+            assert adapter._cache.register_pending("Utrigger") is not None
+            assert victim_guard is not None and victim_guard.blocked is True
+            assert "Uvictim" not in adapter._blocked_slow_pushes
+
+            adapter._block_slow_push("Uevict1")
+            adapter._block_slow_push("Uevict2")
+            adapter._block_slow_push("Uevict3")
+            assert len(adapter._blocked_slow_pushes) <= 2
+
+            release.set()
+            await adapter._session_tasks["Uvictim"]
+
+            assert not result["final"].success
+            adapter._client.push.assert_not_called()
 
         asyncio.run(scenario())
 

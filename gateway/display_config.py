@@ -151,6 +151,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "feishu":          _TIER_MEDIUM,
 
     # Tier 3 — no edit support, progress messages are permanent
+    "line":            _TIER_LOW,
     "signal":          _TIER_LOW,
     "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
     # WhatsApp Cloud API: Meta added message editing in 2023 but the

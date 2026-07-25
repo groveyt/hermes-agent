@@ -274,6 +274,16 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "photon", "busy_ack_detail") is False
         assert resolve_display_setting({}, "photon", "streaming") is False
 
+    def test_line_defaults_to_final_answer_only(self):
+        """LINE heartbeats are permanent and can consume metered Push quota."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "line", "tool_progress") == "off"
+        assert resolve_display_setting({}, "line", "interim_assistant_messages") is False
+        assert resolve_display_setting({}, "line", "long_running_notifications") is False
+        assert resolve_display_setting({}, "line", "busy_ack_detail") is False
+        assert resolve_display_setting({}, "line", "streaming") is False
+
     def test_whatsapp_cloud_locked_to_low_tier_until_edit_message_lands(self):
         """Regression guard: ``whatsapp_cloud`` must stay TIER_LOW until the
         adapter implements edit_message. Without an edit endpoint, raising

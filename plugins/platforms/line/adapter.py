@@ -78,16 +78,30 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _DeliveryTaskGuard:
+    """Unbounded-by-lifetime authorization carried only by one inbound task."""
+
+    adapter: Any
+    chat_id: str
+    run_id: str
+    blocked: bool = False
+
 
 # Immutable connection authorization copied into each inbound processing task.
 # Unlike the bounded diagnostic run map, this value cannot be evicted while an
 # old task remains alive after disconnect/reconnect.
 _DELIVERY_TASK_EPOCH: ContextVar[Optional[Tuple[Any, int]]] = ContextVar(
     "line_delivery_task_epoch", default=None
+)
+_DELIVERY_TASK_GUARD: ContextVar[Optional[_DeliveryTaskGuard]] = ContextVar(
+    "line_delivery_task_guard", default=None
 )
 
 # ---------------------------------------------------------------------------
@@ -101,6 +115,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _is_trusted_non_conversational_metadata,
     cache_image_from_bytes,
 )
 from gateway.config import Platform
@@ -317,6 +332,7 @@ class _CacheEntry:
     state: State
     payload: Any = None
     chat_id: str = ""
+    delivery_guard: Optional[_DeliveryTaskGuard] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -333,32 +349,56 @@ class RequestCache:
         self,
         ttl_seconds: int = 3600,
         pending_ttl_seconds: int = 86400,
+        max_entries: int = MAX_DELIVERY_STATE_ENTRIES,
+        on_prune: Optional[Callable[[Dict[str, _CacheEntry]], None]] = None,
     ) -> None:
         self._entries: Dict[str, _CacheEntry] = {}
         self._ttl = ttl_seconds
         self._pending_ttl = pending_ttl_seconds
+        try:
+            parsed_max_entries = int(max_entries)
+        except (TypeError, ValueError):
+            parsed_max_entries = MAX_DELIVERY_STATE_ENTRIES
+        self._max_entries = max(1, parsed_max_entries)
+        self._on_prune = on_prune
 
-    def register_pending(self, chat_id: str) -> str:
+    def register_pending(
+        self,
+        chat_id: str,
+        delivery_guard: Optional[_DeliveryTaskGuard] = None,
+    ) -> Optional[str]:
+        self.prune()
+        if len(self._entries) >= self._max_entries:
+            return None
         rid = str(uuid.uuid4())
-        self._entries[rid] = _CacheEntry(state=State.PENDING, chat_id=chat_id)
+        self._entries[rid] = _CacheEntry(
+            state=State.PENDING,
+            chat_id=chat_id,
+            delivery_guard=delivery_guard,
+        )
         return rid
 
     def get(self, request_id: str) -> Optional[_CacheEntry]:
+        self.prune()
         return self._entries.get(request_id)
 
     def discard(self, request_id: str) -> None:
         self._entries.pop(request_id, None)
 
-    def set_ready(self, request_id: str, payload: Any) -> None:
-        entry = self._entries.get(request_id)
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def set_ready(self, request_id: str, payload: Any) -> bool:
+        entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
-            return
+            return False
         entry.state = State.READY
         entry.payload = payload
         entry.updated_at = time.time()
+        return True
 
     def set_error(self, request_id: str, message: str) -> None:
-        entry = self._entries.get(request_id)
+        entry = self.get(request_id)
         if entry is None or entry.state is not State.PENDING:
             return
         entry.state = State.ERROR
@@ -366,32 +406,35 @@ class RequestCache:
         entry.updated_at = time.time()
 
     def mark_delivered(self, request_id: str) -> None:
-        entry = self._entries.get(request_id)
+        entry = self.get(request_id)
         if entry is None or entry.state not in {State.READY, State.ERROR}:
             return
         entry.state = State.DELIVERED
         entry.updated_at = time.time()
 
     def find_pending_for_chat(self, chat_id: str) -> Optional[str]:
+        self.prune()
         for rid, entry in self._entries.items():
             if entry.state is State.PENDING and entry.chat_id == chat_id:
                 return rid
         return None
 
-    def prune(self) -> int:
+    def prune(self) -> Set[str]:
         now = time.time()
-        removed = 0
+        removed_entries: Dict[str, _CacheEntry] = {}
         for rid in list(self._entries.keys()):
             entry = self._entries[rid]
             if entry.state is State.PENDING:
                 if now - entry.created_at > self._pending_ttl:
                     del self._entries[rid]
-                    removed += 1
+                    removed_entries[rid] = entry
             else:
                 if now - entry.updated_at > self._ttl:
                     del self._entries[rid]
-                    removed += 1
-        return removed
+                    removed_entries[rid] = entry
+        if removed_entries and self._on_prune:
+            self._on_prune(removed_entries)
+        return set(removed_entries)
 
 
 @dataclass(frozen=True)
@@ -460,10 +503,14 @@ class _PushQuotaBudget:
             try:
                 raw_limit = quota["value"]
                 raw_usage = consumption["totalUsage"]
-                if isinstance(raw_limit, bool) or isinstance(raw_usage, bool):
-                    raise ValueError
-                limit = int(raw_limit)
-                usage = int(raw_usage)
+
+                def _strict_count(value: Any) -> int:
+                    if type(value) is not int:
+                        raise ValueError
+                    return value
+
+                limit = _strict_count(raw_limit)
+                usage = _strict_count(raw_usage)
             except (KeyError, TypeError, ValueError, OverflowError):
                 return QuotaDecision(False, "quota_invalid")
             if limit <= 0 or usage < 0:
@@ -972,7 +1019,7 @@ class LineAdapter(BasePlatformAdapter):
         self._runner = None  # aiohttp.web.AppRunner
         self._site = None  # aiohttp.web.TCPSite
         self._reply_tokens: Dict[str, Tuple[str, float]] = {}  # chat_id → (token, expiry)
-        self._cache = RequestCache()
+        self._cache = RequestCache(on_prune=self._cleanup_pruned_requests)
         self._dedup = _MessageDeduplicator()
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
@@ -1014,6 +1061,28 @@ class LineAdapter(BasePlatformAdapter):
         # Postbacks selected specifically to avoid metered Push. A rejected
         # fresh reply token must not fall back to Push and bypass the budget.
         self._quota_guarded_postbacks: Set[str] = set()
+
+    def _cleanup_pruned_requests(
+        self, removed_entries: Dict[str, _CacheEntry]
+    ) -> None:
+        """Revoke bound runs and remove side state for TTL-evicted entries."""
+        if not removed_entries:
+            return
+        request_ids = set(removed_entries)
+        fallback_chats: List[str] = []
+        for chat_id, request_id in list(self._pending_buttons.items()):
+            if request_id in request_ids:
+                self._pending_buttons.pop(chat_id, None)
+                if request_id in self._quota_guarded_postbacks:
+                    guard = removed_entries[request_id].delivery_guard
+                    if guard is not None and guard.adapter is self:
+                        guard.blocked = True
+                    else:
+                        fallback_chats.append(chat_id)
+        self._quota_guarded_postbacks.difference_update(request_ids)
+        self._postback_delivering.difference_update(request_ids)
+        for chat_id in fallback_chats:
+            self._block_slow_push(chat_id)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1149,6 +1218,7 @@ class LineAdapter(BasePlatformAdapter):
         self._auto_push_completed_runs.clear()
         self._auto_push_completed_chats.clear()
         self._blocked_slow_pushes.clear()
+        self._cache.clear()
         self._pending_buttons.clear()
         self._postback_delivering.clear()
         self._quota_guarded_postbacks.clear()
@@ -1178,8 +1248,22 @@ class LineAdapter(BasePlatformAdapter):
             pass
         return ""
 
+    def _current_delivery_guard(
+        self, chat_id: str
+    ) -> Optional[_DeliveryTaskGuard]:
+        guard = _DELIVERY_TASK_GUARD.get()
+        if guard is not None and guard.adapter is self and guard.chat_id == chat_id:
+            return guard
+        return None
+
+    def _has_foreign_delivery_context(self) -> bool:
+        task_epoch = _DELIVERY_TASK_EPOCH.get()
+        return task_epoch is not None and task_epoch[0] is not self
+
     def _delivery_run_id(self, chat_id: str) -> str:
-        """Return the task-local inbound generation, falling back to live run."""
+        """Return this adapter's task generation, falling back to its live run."""
+        if self._has_foreign_delivery_context():
+            return ""
         return self._context_delivery_run_id(chat_id) or self._delivery_run_by_chat.get(
             chat_id, ""
         )
@@ -1222,6 +1306,9 @@ class LineAdapter(BasePlatformAdapter):
                 break
 
     def _block_slow_push(self, chat_id: str) -> None:
+        guard = self._current_delivery_guard(chat_id)
+        if guard is not None:
+            guard.blocked = True
         self._touch_delivery_state(chat_id)
         self._blocked_slow_pushes.add(chat_id)
 
@@ -1314,6 +1401,10 @@ class LineAdapter(BasePlatformAdapter):
         *,
         interrupt_event: Optional[asyncio.Event] = None,
     ) -> bool:
+        run_id = event.message_id or session_key
+        guard_token = _DELIVERY_TASK_GUARD.set(
+            _DeliveryTaskGuard(self, event.source.chat_id, run_id)
+        )
         epoch_token = _DELIVERY_TASK_EPOCH.set((self, self._delivery_epoch))
         try:
             started = super()._start_session_processing(
@@ -1321,8 +1412,9 @@ class LineAdapter(BasePlatformAdapter):
             )
         finally:
             _DELIVERY_TASK_EPOCH.reset(epoch_token)
+            _DELIVERY_TASK_GUARD.reset(guard_token)
         if started:
-            self._begin_delivery_run(event.source.chat_id, event.message_id or session_key)
+            self._begin_delivery_run(event.source.chat_id, run_id)
         return started
 
     async def _handle_health(self, request) -> Any:
@@ -1602,7 +1694,12 @@ class LineAdapter(BasePlatformAdapter):
         self, chat_id: str, reply_token: str, messages: List[Dict[str, Any]]
     ) -> bool:
         """Send Reply only while the caller's immutable epoch is current."""
-        if not self._client or self._delivery_completed(chat_id):
+        guard = self._current_delivery_guard(chat_id)
+        if (
+            not self._client
+            or self._delivery_completed(chat_id)
+            or (guard is not None and guard.blocked)
+        ):
             return False
         await self._client.reply(reply_token, messages)
         return True
@@ -1611,7 +1708,12 @@ class LineAdapter(BasePlatformAdapter):
         self, chat_id: str, messages: List[Dict[str, Any]]
     ) -> bool:
         """Send Push only while the caller's immutable epoch is current."""
-        if not self._client or self._delivery_completed(chat_id):
+        guard = self._current_delivery_guard(chat_id)
+        if (
+            not self._client
+            or self._delivery_completed(chat_id)
+            or (guard is not None and guard.blocked)
+        ):
             return False
         await self._client.push(chat_id, messages)
         return True
@@ -1627,9 +1729,44 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="LINE adapter not connected")
 
         if self._delivery_completed(chat_id):
+            logger.info(
+                "LINE delivery suppressed: reason=run_completed kind=text"
+            )
             return SendResult(success=True, message_id=None)
+        if (
+            self._has_foreign_delivery_context()
+            and chat_id in self._auto_push_reservations
+        ):
+            logger.info(
+                "LINE delivery suppressed: reason=foreign_context_active_reservation "
+                "kind=text"
+            )
+            return SendResult(
+                success=False,
+                error="LINE foreign delivery context conflicts with active reservation",
+            )
 
-        is_system_bypass = _is_system_bypass(content)
+        trusted_non_conversational = _is_trusted_non_conversational_metadata(
+            metadata
+        )
+        is_heartbeat = (
+            trusted_non_conversational
+            and content.startswith("⏳ Working —")
+        )
+        is_system_bypass = _is_system_bypass(content) or is_heartbeat
+        guard = self._current_delivery_guard(chat_id)
+        if guard is not None and guard.blocked:
+            kind = "heartbeat" if is_heartbeat else "text"
+            logger.info(
+                "LINE delivery suppressed: reason=task_guard_blocked kind=%s",
+                kind,
+            )
+            if is_system_bypass:
+                return SendResult(success=True, message_id=None)
+            return SendResult(
+                success=False,
+                error="LINE slow-response Push blocked by task delivery policy",
+            )
         if not is_system_bypass and chat_id in self._blocked_slow_pushes:
             self._blocked_slow_pushes.discard(chat_id)
             return SendResult(
@@ -1640,6 +1777,11 @@ class LineAdapter(BasePlatformAdapter):
         # Once a slow final owns the single Push reservation, suppress noisy
         # system acks rather than letting them spend an untracked Push first.
         if is_system_bypass and self._has_auto_push_reservation(chat_id):
+            kind = "heartbeat" if is_heartbeat else "system"
+            logger.info(
+                "LINE delivery suppressed: reason=reserved_for_final kind=%s",
+                kind,
+            )
             return SendResult(success=True, message_id=None)
 
         # System busy-acks (interrupting / queued / steered) bypass the
@@ -1658,8 +1800,19 @@ class LineAdapter(BasePlatformAdapter):
         # response into the cache for the user to fetch via tap.
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
-            self._cache.set_ready(pending_rid, content)
-            return SendResult(success=True, message_id=pending_rid)
+            quota_guarded = pending_rid in self._quota_guarded_postbacks
+            if self._cache.set_ready(pending_rid, content):
+                return SendResult(success=True, message_id=pending_rid)
+            guard = self._current_delivery_guard(chat_id)
+            if (
+                quota_guarded
+                or (guard is not None and guard.blocked)
+                or chat_id in self._blocked_slow_pushes
+            ):
+                return SendResult(
+                    success=False,
+                    error="LINE postback expired; Push blocked by quota policy",
+                )
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
 
@@ -1765,6 +1918,8 @@ class LineAdapter(BasePlatformAdapter):
 
     def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
         """Consume a matching, unexpired single-use Reply token."""
+        if self._has_foreign_delivery_context():
+            return "", False
         token_run = self._reply_token_runs.get(chat_id, "")
         active_run = self._delivery_run_id(chat_id)
         if token_run and active_run and token_run != active_run:
@@ -1875,7 +2030,26 @@ class LineAdapter(BasePlatformAdapter):
             # expires, final delivery settles exactly one Push reservation.
             return
 
-        rid = self._cache.register_pending(chat_id)
+        rid = self._cache.register_pending(
+            chat_id,
+            delivery_guard=self._current_delivery_guard(chat_id),
+        )
+        if rid is None:
+            logger.warning("LINE: postback cache at capacity; request denied")
+            token, used = self._consume_reply_token(chat_id)
+            if used:
+                try:
+                    await self._reply_current(
+                        chat_id, token, [_text_message(self.pending_text)]
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "LINE: cache-capacity notice delivery failed (%s)",
+                        type(exc).__name__,
+                    )
+            if self.slow_response_mode == "auto_push":
+                self._block_slow_push(chat_id)
+            return
         self._pending_buttons[chat_id] = rid
         if self.slow_response_mode == "auto_push":
             self._quota_guarded_postbacks.add(rid)
@@ -1955,20 +2129,71 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound media (image / voice / video)
     # ------------------------------------------------------------------
 
+    def _native_media_policy_failure(self, chat_id: str) -> Optional[SendResult]:
+        """Fail closed before media registration when no paid Push is authorized."""
+        if (
+            self._has_foreign_delivery_context()
+            and chat_id in self._auto_push_reservations
+        ):
+            logger.info(
+                "LINE delivery suppressed: reason=foreign_context_active_reservation "
+                "kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE foreign media context conflicts with active reservation",
+            )
+        guard = self._current_delivery_guard(chat_id)
+        if guard is not None and guard.blocked:
+            logger.info(
+                "LINE delivery suppressed: reason=task_guard_blocked kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE native media Push blocked by task delivery policy",
+            )
+        if chat_id in self._pending_buttons:
+            logger.info(
+                "LINE delivery suppressed: reason=postback_pending kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE native media unavailable while postback delivery is pending",
+            )
+        if chat_id in self._blocked_slow_pushes:
+            logger.info(
+                "LINE delivery suppressed: reason=quota_blocked kind=media"
+            )
+            return SendResult(
+                success=False,
+                error="LINE native media Push blocked by quota policy",
+            )
+        return None
+
+    def _drop_media_token(self, token: str) -> None:
+        entry = self._media_tokens.pop(token, None)
+        if not entry:
+            return
+        path, _ = entry
+        if path not in self._media_temp_paths:
+            return
+        if any(other_path == path for other_path, _ in self._media_tokens.values()):
+            return
+        self._media_temp_paths.discard(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def _register_media(self, file_path: str, *, cleanup: bool = False) -> str:
         """Register a local file for HTTPS serving; return the URL token."""
-        # Evict expired tokens first.
         now = time.time()
-        for token in list(self._media_tokens.keys()):
-            path, exp = self._media_tokens[token]
-            if now > exp:
-                self._media_tokens.pop(token, None)
-                if path in self._media_temp_paths:
-                    self._media_temp_paths.discard(path)
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+        for token, (_, expires_at) in list(self._media_tokens.items()):
+            if now > expires_at:
+                self._drop_media_token(token)
+        max_tokens = max(1, MAX_DELIVERY_STATE_ENTRIES)
+        while len(self._media_tokens) >= max_tokens:
+            self._drop_media_token(next(iter(self._media_tokens)))
 
         resolved = str(Path(file_path).resolve())
         token = secrets.token_urlsafe(32)
@@ -2009,7 +2234,7 @@ class LineAdapter(BasePlatformAdapter):
 
         file_path, expires_at = entry
         if time.time() > expires_at:
-            self._media_tokens.pop(token, None)
+            self._drop_media_token(token)
             return web.Response(status=410, text="gone")
 
         path = Path(file_path)
@@ -2047,6 +2272,9 @@ class LineAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self._delivery_completed(chat_id):
             return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         path = Path(image_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"image file not found: {image_path}")
@@ -2079,6 +2307,9 @@ class LineAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self._delivery_completed(chat_id):
             return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         path = Path(audio_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"audio file not found: {audio_path}")
@@ -2105,6 +2336,9 @@ class LineAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self._delivery_completed(chat_id):
             return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         path = Path(video_path)
         if not path.exists() or not path.is_file():
             return SendResult(success=False, error=f"video file not found: {video_path}")
@@ -2153,6 +2387,9 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="LINE adapter not connected")
         if self._delivery_completed(chat_id):
             return SendResult(success=True, message_id=None)
+        policy_failure = self._native_media_policy_failure(chat_id)
+        if policy_failure:
+            return policy_failure
         if not messages:
             return SendResult(success=True, message_id=None)
 
