@@ -115,7 +115,9 @@ Add the bot as a friend from the LINE app (scan the QR in the channel's **Messag
 
 ## Slow LLM responses
 
-LINE's reply token is single-use and expires roughly 60 seconds after the inbound event. Slow LLMs can't reply in time, which would normally force a paid Push API call.
+LINE's reply token is single-use and expires roughly 60 seconds after the inbound event. The adapter supports two slow-response modes while always preferring a free Reply for answers completed before the token expires.
+
+### Postback mode (default, zero Push usage)
 
 When the LLM is still running past `LINE_SLOW_RESPONSE_THRESHOLD` seconds (default `45`), the adapter consumes the original reply token to send a **Template Buttons** bubble:
 
@@ -127,13 +129,39 @@ The user taps **Get answer** when convenient — that postback delivers a *fresh
 
 State machine: `PENDING → READY → DELIVERED`, plus `ERROR` for cancelled runs (the orphan PENDING resolves to "Run was interrupted before completion." after `/stop` so the persistent button doesn't loop).
 
-To disable the postback button and always Push-fallback instead:
+### Budget-aware automatic Push (opt-in)
 
-```env
-LINE_SLOW_RESPONSE_THRESHOLD=0
+For a smoother 1:1 DM experience, `auto_push` checks LINE's live monthly quota and consumption at the slow threshold. If one more Push stays within the configured soft limit, Hermes reserves it and automatically sends the final answer once. Answers that finish before the reply token expires still use free Reply.
+
+```yaml
+# ~/.hermes/config.yaml
+gateway:
+  platforms:
+    line:
+      enabled: true
+      extra:
+        slow_response_mode: auto_push
+        push_quota_soft_limit_ratio: 0.8
+        quota_lookup_timeout_seconds: 3
 ```
 
-For the postback flow to fire reliably, suppress chatter that would consume the reply token before the threshold:
+Safety behavior:
+
+- `postback` remains the default for backward compatibility.
+- Only 1:1 DMs are eligible for automatic Push. Groups and rooms use postback because LINE counts a Push by recipients, not message objects.
+- At or above the soft limit, Hermes uses postback.
+- Quota API timeout, 401, 429, 5xx, malformed data, or an unknown quota type fails closed to postback.
+- Concurrent slow requests reserve against an in-process estimate so they cannot spend the same remaining slot.
+- A successful Push updates the estimate immediately, covering lag in LINE's consumption endpoint.
+- One reservation permits at most one final text or native-media Push; system acknowledgements and later output from the same run are suppressed.
+- Ambiguous Reply/Push timeouts are never retried as another delivery. This favors no duplicates over guaranteed delivery.
+- Gateway restarts interrupt in-flight runs; reservations are intentionally not persisted across restarts.
+
+`push_quota_soft_limit_ratio` accepts values above `0` through `1`; invalid values use the safe default `0.8`.
+
+To disable the postback threshold entirely, set `LINE_SLOW_RESPONSE_THRESHOLD=0`. This still prefers an unexpired Reply token, but after expiry it Pushes without the budget-aware threshold decision, so it is **not recommended when quota protection matters**.
+
+For either slow-response mode to fire reliably, suppress chatter that could consume the reply token before the threshold:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -142,6 +170,9 @@ display:
   platforms:
     line:
       tool_progress: off
+      streaming: false
+      long_running_notifications: false
+      busy_ack_detail: false
 ```
 
 ---
@@ -170,7 +201,7 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 | `LINE_ALLOWED_ROOMS` | one of | — | Comma-separated room IDs (R-prefixed) |
 | `LINE_ALLOW_ALL_USERS` | dev only | `false` | Skip allowlist entirely |
 | `LINE_HOME_CHANNEL` | no | — | Default cron / notification delivery target |
-| `LINE_SLOW_RESPONSE_THRESHOLD` | no | `45` | Seconds before the postback button fires (`0` = disabled) |
+| `LINE_SLOW_RESPONSE_THRESHOLD` | no | `45` | Seconds before slow-response quota policy runs (`0` = disable policy routing) |
 | `LINE_PENDING_TEXT` | no | "🤔 Still thinking…" | Bubble text shown alongside the postback button |
 | `LINE_BUTTON_LABEL` | no | "Get answer" | Button label |
 | `LINE_DELIVERED_TEXT` | no | "Already replied ✅" | Reply when an already-delivered button is tapped again |

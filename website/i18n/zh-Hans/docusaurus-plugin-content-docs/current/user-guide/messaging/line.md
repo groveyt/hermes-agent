@@ -113,25 +113,41 @@ LINE: webhook listening on 0.0.0.0:8646/line/webhook (public: https://my-tunnel.
 
 ## LLM 响应缓慢
 
-LINE 的 reply token 为单次使用，在入站事件发生后约 60 秒过期。LLM 响应过慢时将无法及时回复，通常会被迫调用付费的 Push API。
+LINE 的 reply token 只能使用一次，并会在入站事件后约 60 秒过期。适配器有两种慢响应模式；只要答案在 token 过期前完成，都会优先使用免费的 Reply。
 
-当 LLM 运行时间超过 `LINE_SLOW_RESPONSE_THRESHOLD` 秒（默认 `45`）时，适配器会消耗原始 reply token，发送一个 **Template Buttons** 气泡：
+### Postback 模式（默认，不消耗 Push 额度）
 
-> 🤔 Still thinking. Tap below to fetch the answer when it's ready.
->
-> [ Get answer ]
+当运行时间超过 `LINE_SLOW_RESPONSE_THRESHOLD` 秒（默认 `45`）时，适配器会使用原始 reply token 发送 **Template Buttons** 气泡。用户点击 **Get answer** 后会产生新的 reply token，适配器再免费发送缓存答案。
 
-用户在方便时点击 **Get answer** — 该 postback 会带来一个*新的* reply token，适配器用它发送缓存的答案（仍然免费）。
+### 顾及额度的自动 Push（选择启用）
 
-状态机：`PENDING → READY → DELIVERED`，以及 `ERROR`（用于已取消的运行 — 执行 `/stop` 后，孤立的 PENDING 状态会解析为"Run was interrupted before completion."，避免持久按钮循环触发）。
+`auto_push` 会在慢响应阈值到达时查询 LINE 当月额度与使用量。若再 Push 一次仍在软上限内，Hermes 会保留一次额度并在答案完成后自动发送；若答案在 reply token 过期前完成，仍会免费 Reply。
 
-如需禁用 postback 按钮并始终回退至 Push API：
-
-```env
-LINE_SLOW_RESPONSE_THRESHOLD=0
+```yaml
+gateway:
+  platforms:
+    line:
+      enabled: true
+      extra:
+        slow_response_mode: auto_push
+        push_quota_soft_limit_ratio: 0.8
+        quota_lookup_timeout_seconds: 3
 ```
 
-为使 postback 流程可靠触发，请抑制可能在阈值前消耗 reply token 的冗余输出：
+安全策略：
+
+- `postback` 保持为向后兼容的默认值。
+- 只有 1:1 私聊可以自动 Push；群组与 room 使用 postback，避免按收件人数放大额度。
+- 达到软上限时使用 postback。
+- Quota API timeout、401、429、5xx、格式错误或未知类型时，保守降级为 postback。
+- 并发慢任务会使用本机 reservation 估算，避免共用同一剩余额度。
+- 一个 reservation 最多允许一次 final text 或原生媒体 Push；同一轮的系统状态与后续输出会被抑制。
+- Reply／Push timeout 若无法确认是否送达，不会自动改走另一条发送路径，优先避免重复讯息。
+- Gateway 重启会中断进行中的任务；reservation 不跨重启保存。
+
+将 `LINE_SLOW_RESPONSE_THRESHOLD=0` 会关闭上述慢响应政策判断。它仍会优先尝试未过期的 Reply，但 token 过期后可能直接 Push，因此在需要额度保护时不建议使用。
+
+为了避免其他输出提前消耗 reply token，请关闭 LINE 的进度与中途消息：
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -140,6 +156,9 @@ display:
   platforms:
     line:
       tool_progress: off
+      streaming: false
+      long_running_notifications: false
+      busy_ack_detail: false
 ```
 
 ---
@@ -168,7 +187,7 @@ LINE_HOME_CHANNEL=Uxxxxxxxxxxxxxxxxxxxx     # 默认推送目标
 | `LINE_ALLOWED_ROOMS` | 三选一 | — | 逗号分隔的房间 ID（R 开头） |
 | `LINE_ALLOW_ALL_USERS` | 仅开发环境 | `false` | 完全跳过白名单验证 |
 | `LINE_HOME_CHANNEL` | 否 | — | 默认 cron / 通知推送目标 |
-| `LINE_SLOW_RESPONSE_THRESHOLD` | 否 | `45` | 触发 postback 按钮的等待秒数（`0` = 禁用） |
+| `LINE_SLOW_RESPONSE_THRESHOLD` | 否 | `45` | 触发慢响应额度判断的等待秒数（`0` = 禁用政策路由） |
 | `LINE_PENDING_TEXT` | 否 | "🤔 Still thinking…" | postback 按钮旁显示的气泡文本 |
 | `LINE_BUTTON_LABEL` | 否 | "Get answer" | 按钮标签 |
 | `LINE_DELIVERED_TEXT` | 否 | "Already replied ✅" | 再次点击已送达按钮时的回复 |
